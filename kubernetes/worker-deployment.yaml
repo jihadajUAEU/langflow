@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: langflow
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+      - name: worker
+        image: langflow.azurecr.io/langflow-worker:latest
+        env:
+        - name: REDIS_HOST
+          value: redis
+        - name: POSTGRES_HOST
+          value: postgres
+        - name: RABBITMQ_HOST
+          value: rabbitmq
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: langflow-secrets
+              key: database-url
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: langflow-secrets
+              key: redis-password
+        - name: CELERY_BROKER_URL
+          valueFrom:
+            secretKeyRef:
+              name: langflow-secrets
+              key: rabbitmq-url
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        livenessProbe:
+          exec:
+            command:
+            - celery
+            - -A
+            - worker
+            - inspect
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - celery
+            - -A
+            - worker
+            - inspect
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      imagePullSecrets:
+      - name: acr-secret

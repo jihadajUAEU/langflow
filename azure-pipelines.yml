@@ -1,0 +1,151 @@
+trigger:
+  - main
+
+variables:
+  - group: langflow-production
+  - name: containerRegistry
+    value: 'langflow.azurecr.io'
+  - name: frontendImageName
+    value: 'langflow-frontend'
+  - name: backendImageName
+    value: 'langflow-backend'
+  - name: workerImageName
+    value: 'langflow-worker'
+  - name: tag
+    value: '$(Build.BuildId)'
+
+stages:
+  - stage: Build
+    jobs:
+      - job: BuildFrontend
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: Docker@2
+            inputs:
+              containerRegistry: 'Azure Container Registry'
+              repository: '$(frontendImageName)'
+              command: 'buildAndPush'
+              Dockerfile: 'docker/frontend/build_and_push_frontend.Dockerfile'
+              tags: |
+                $(tag)
+                latest
+              
+      - job: BuildBackend
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: Docker@2
+            inputs:
+              containerRegistry: 'Azure Container Registry'
+              repository: '$(backendImageName)'
+              command: 'buildAndPush'
+              Dockerfile: 'docker/build_and_push_backend.Dockerfile'
+              tags: |
+                $(tag)
+                latest
+
+      - job: BuildWorker
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: Docker@2
+            inputs:
+              containerRegistry: 'Azure Container Registry'
+              repository: '$(workerImageName)'
+              command: 'buildAndPush'
+              Dockerfile: 'docker/build_and_push_ep.Dockerfile'
+              tags: |
+                $(tag)
+                latest
+
+  - stage: Test
+    jobs:
+      - job: UnitTests
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.10'
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              pip install pytest pytest-cov
+              pytest tests/ --cov=./ --cov-report=xml
+            displayName: 'Run Python Unit Tests'
+
+  - stage: SecurityScan
+    jobs:
+      - job: ContainerScan
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: ContainerStructureTest@0
+            inputs:
+              dockerRegistryServiceConnection: 'Azure Container Registry'
+              repository: '$(frontendImageName)'
+              tag: '$(tag)'
+              configFile: 'tests/container/frontend.yaml'
+
+          - task: ContainerStructureTest@0
+            inputs:
+              dockerRegistryServiceConnection: 'Azure Container Registry'
+              repository: '$(backendImageName)'
+              tag: '$(tag)'
+              configFile: 'tests/container/backend.yaml'
+
+  - stage: Deploy
+    jobs:
+      - deployment: Production
+        pool:
+          vmImage: ubuntu-latest
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: PowerShell@2
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      # Login to Azure and set context
+                      az aks get-credentials --resource-group langflow-resources --name langflow-aks
+
+                      # Update deployment manifests with new image tags
+                      sed -i "s|image:.*|image: $(containerRegistry)/$(frontendImageName):$(tag)|" kubernetes/frontend-deployment.yaml
+                      sed -i "s|image:.*|image: $(containerRegistry)/$(backendImageName):$(tag)|" kubernetes/backend-deployment.yaml
+                      sed -i "s|image:.*|image: $(containerRegistry)/$(workerImageName):$(tag)|" kubernetes/worker-deployment.yaml
+
+                      # Apply Kubernetes manifests
+                      kubectl apply -f kubernetes/frontend-deployment.yaml
+                      kubectl apply -f kubernetes/backend-deployment.yaml
+                      kubectl apply -f kubernetes/worker-deployment.yaml
+                      kubectl apply -f kubernetes/services.yaml
+                      kubectl apply -f kubernetes/ingress.yaml
+
+                      # Wait for deployments to be ready
+                      kubectl rollout status deployment/frontend -n langflow
+                      kubectl rollout status deployment/backend -n langflow
+                      kubectl rollout status deployment/worker -n langflow
+
+  - stage: Monitoring
+    jobs:
+      - job: SetupMonitoring
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: PowerShell@2
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Add Helm repo
+                helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+                helm repo update
+
+                # Install Prometheus and Grafana stack
+                helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+                  --namespace monitoring --create-namespace \
+                  --set grafana.enabled=true \
+                  --set prometheus.enabled=true \
+                  --version 45.7.1
